@@ -1,8 +1,3 @@
-/*
-    STRETCH GOAL IDEAS:
-        * modularize the code - linking/modules/static vars, etc
-*/ 
-
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -20,12 +15,15 @@
 #define TOKEN_EXIT "exit"
 #define TOKEN_HELP "help"
 #define TOKEN_LOGOUT "logout"
-#define TOKEN_ECHO "echo"
 #define TOKEN_PIPE "|"
 
 #define DEBUG 0
 
+// TODO is this still being used?
 volatile pid_t child_proc;
+
+// Temporarily reference this as an extern
+extern void execute(char *);
 
 void render_prompt() {
     printf("> ");
@@ -40,102 +38,97 @@ void handle_sigint() {
     kill(child_proc, SIGINT);
 }
 
-struct child_proc {
+/* 
+    Process Stuff
+*/
+struct Process {
     int ifd;
     int ofd;
     char *args[MAX_ARGS];
     pid_t pid;
+    char* (*print)(struct Process *);
+    char printStr[1024];
 };
 
-struct pipe {
-    struct child_proc* writer;
-    struct child_proc* reader;
-    int write_fd;
-    int read_fd;
-};
+char *processPrint(struct Process *p) {
+    int written;
+    char *start_at = p->printStr;
 
-void debug_child_proc(struct child_proc *job) {
-    if (!DEBUG) return;
-    int a = 0;
+    written = sprintf(p->printStr, "Process for");
+    start_at += written;
 
-    printf("[%d] Job: ", getpid());
-
-    while (job->args[a] != NULL) {
-        printf("%s ", job->args[a]);
-        a++;
+    for (int i = 0; p->args[i] != NULL; i++) {
+        written = sprintf(start_at, " %s", p->args[i]);
+        start_at += written;
     }
-
-    printf("(Reads from %d; writes to %d)\n", job->ifd, job->ofd);
+    
+    return p->printStr;
 }
 
-void debug_pipe(struct pipe *p) {
-    if (!DEBUG) return;
-
-    printf("Write: %d; Read: %d\n", p->write_fd, p->read_fd);
+struct Process *setupProcess() {
+    struct Process *p = malloc(sizeof(struct Process));
+    p->print = processPrint;
 }
 
-int parse_command_line(char *buffer, struct child_proc *jobs[], struct pipe *pipes[]) {
-    int pipefd[2];
+void destroyProcess(struct Process *p) {
+    free(p);
+}
+
+/* 
+    END Process Stuff
+*/
+
+int parse_command_line(char *buffer, struct Process *jobs[], struct Logger *logger) {
     int job_no = 0;
     int arg_no = 0;
-    int pipe_no = 0;
 
-    jobs[job_no] = malloc(sizeof(struct child_proc));
-
-    jobs[job_no]->ifd = STDIN_FILENO;  // we don't know any differently yet
-    jobs[job_no]->ofd = STDOUT_FILENO; // we don't know any differently yet
+    jobs[job_no] = setupProcess();
 
     char *last_token;
     jobs[job_no]->args[arg_no] = strtok(buffer, " \t\n");
     last_token = jobs[job_no]->args[arg_no];
-    if (DEBUG) printf("read: %s (job %d, arg %d)\n", last_token, job_no, arg_no);
+    logger->debug(logger, "read: %s (job %d, arg %d)", last_token, job_no, arg_no);
 
     while (last_token != NULL) { // until we reach end of string
         jobs[job_no]->args[++arg_no] = strtok(NULL, " \t\n"); // get the next token
         last_token = jobs[job_no]->args[arg_no];
-        if (DEBUG) printf("read: %s (job %d, arg %d)\n", last_token, job_no, arg_no);
+        logger->debug(logger, "read: %s (job %d, arg %d)", last_token, job_no, arg_no);
 
         if (jobs[job_no]->args[arg_no] != NULL && strcmp(TOKEN_PIPE, jobs[job_no]->args[arg_no]) == 0) { // if the next token is a pipe
-            if (DEBUG) printf("pipe detected!\n");
-            pipes[pipe_no] = malloc(sizeof(struct pipe));
+            logger->debug(logger, "pipe detected!");
             jobs[job_no]->args[arg_no] = NULL; //      write NULL to args[i]
-
-            // Setup a new pipe
-            if (pipe(pipefd) == -1) {
-                perror("pipe");
-                exit;
-            };
-
-            pipes[pipe_no]->read_fd  = pipefd[0];
-            pipes[pipe_no]->write_fd = pipefd[1];
-
-            // Set writer
-            jobs[job_no]->ofd = pipes[pipe_no]->write_fd;
-            pipes[pipe_no]->writer = jobs[job_no];
             
             // Pointer accounting (point to next job)
             job_no++;   //      increment the job index
-            jobs[job_no] = malloc(sizeof(struct child_proc));
-            if (DEBUG) printf("incremented job no to %d\n", job_no);
+            jobs[job_no] = setupProcess();
+            logger->debug(logger, "incremented job no to %d", job_no);
             arg_no = -1;   //      set arg index to zero
-            if (DEBUG) printf("reset arg no to %d\n", arg_no);
-
-            // Set reader
-            jobs[job_no]->ifd = pipes[pipe_no]->read_fd;
-            jobs[job_no]->ofd = STDOUT_FILENO; // we don't know any differently yet
-            pipes[pipe_no]->reader = jobs[job_no];
-
-            // Inc pipe number
-            pipe_no++;
+            logger->debug(logger, "reset arg no to %d", arg_no);
         }
     }
     return job_no + 1;
 }
 
+// struct Job {
+//     char *command; // may not need this...
+//     // pid
+// };
+
+// struct Process {
+//     char *args[MAX_ARGS];
+// };
+
+// struct ProcessGroup {
+
+// };
+
+
+
 int main () {
     char cmd_buffer[CMD_BUFFER_SIZE];
-    struct child_proc *jobs[MAX_JOBS];
+    struct Process *jobs[MAX_JOBS];
     struct pipe *pipes[MAX_PIPES];
+    int pipefd[2];
 
     signal(SIGINT, handle_sigint);
 
@@ -154,7 +147,7 @@ int main () {
 
         fgets(cmd_buffer, CMD_BUFFER_SIZE, stdin);
 
-        int job_cnt = parse_command_line(cmd_buffer, jobs, pipes);
+        int job_cnt = parse_command_line(cmd_buffer, jobs, logger);
         int pipe_cnt = job_cnt - 1;
 
         logger->debug(logger, "found %d jobs", job_cnt);
@@ -176,9 +169,22 @@ int main () {
             continue;
         }
 
+        int input_fd = 0;
+
         for (int i = 0; i < job_cnt; i++) {
-            debug_child_proc(jobs[i]);
-            logger->debug(logger, "Forking child %d", i);
+            logger->debug(logger, "Preparing to fork child %d (%s)", i, jobs[i]->print(jobs[i]));
+
+            // If there is another process downstream create a pipe
+            if (i < (job_cnt - 1)) {
+                logger->debug(logger, "Creating a pipe on main thread");
+
+                if (pipe(pipefd) == -1) {
+                    perror("pipe");
+                    exit;
+                };
+            }
+
+            logger->debug(logger, "Forking child %d (%s)", i, jobs[i]->print(jobs[i]));
             
             jobs[i]->pid = fork();
 
@@ -188,30 +194,25 @@ int main () {
                 // Child Process
                 
                 logger->debug(logger, "Hello from child (%d) process", i);
-                // Fiddle with IO streams
-                logger->debug(logger, "Checking input stream (%d)...", jobs[i]->ifd);
-                if (jobs[i]->ifd != STDIN_FILENO) {
-                    logger->debug(logger, "Dup2-ing fd (%d) to STDIN (%d)", jobs[i]->ifd, STDIN_FILENO);
-                    dup2(jobs[i]->ifd, STDIN_FILENO);
+
+                // Check input stream
+                if (input_fd != STDIN_FILENO) {
+                    logger->debug(logger, "Dup2-ing fd (%d) to STDIN (%d)", input_fd, STDIN_FILENO);
+                    dup2(input_fd, STDIN_FILENO);
+
+                    // I can close this because STDIN_FILENO now points to the 
+                    // read end of the pipe, so closing STDIN will shut down the pipe
+                    close(input_fd);
                 }
 
-                logger->debug(logger, "Checking output stream (%d)...", jobs[i]->ofd);
-                if (jobs[i]->ofd != STDOUT_FILENO) {
-                    logger->debug(logger, "Dup2-ing fd (%d) to stdout (%d)", jobs[i]->ofd, STDOUT_FILENO);
-                    dup2(jobs[i]->ofd, STDOUT_FILENO);
-                }
-
-                // Close any fd's that aren't needed from the pipe array
-                for(int p = 0; p < pipe_cnt; p++) {
-                    if (pipes[p]->writer != jobs[i]) {
-                        logger->debug(logger, "Closing pipe %d writer (fd %d)", p, pipes[p]->write_fd);
-                        if (-1 == close(pipes[p]->write_fd)) perror("close (write)");
-                    }
-
-                    if (pipes[p]->reader != jobs[i]) {
-                        logger->debug(logger, "Closing pipe %d reader (fd %d)", p, pipes[p]->read_fd);
-                        if (-1 == close(pipes[p]->read_fd)) perror("close (read)");
-                    }
+                // Check output stream
+                if (i < job_cnt - 1) {
+                    logger->debug(logger, "Dup2-ing fd (%d) to stdout (%d)", pipefd[1], STDOUT_FILENO);
+                    dup2(pipefd[1], STDOUT_FILENO);
+                    
+                    // I can close this fd because STDOUT_FILENO is still open 
+                    // and pointing to the pipe's write side
+                    close(pipefd[1]);
                 }
 
                 int rc_exec = execvp(jobs[i]->args[0], jobs[i]->args);
@@ -219,16 +220,20 @@ int main () {
                     return 0;
                 }
             }
-        }
 
-        for(int p = 0; p < pipe_cnt; p++) {
-            logger->debug(logger, "Closing pipe %d read-side on main thread (%d)", p, pipes[p]->read_fd);
-            if (-1 == close(pipes[p]->read_fd)) perror("close (read)");
-            
-            logger->debug(logger, "Closing pipe %d write-side on main thread (%d)", p, pipes[p]->write_fd);
-            if (-1 == close(pipes[p]->write_fd)) perror("close (read)");
-
-            free(pipes[p]);
+            // Back in the parent thread...
+            if (i < job_cnt - 1) {
+                logger->debug(logger, "Closing write-side of the pipe (fd %d) on main thread", pipefd[1]);
+                close(pipefd[1]);
+                
+                logger->debug(logger, "Setting input_fd to %d for downstream (%s)", pipefd[0], jobs[i+1]->print(jobs[i+1]));
+                input_fd = pipefd[0];
+            } else {
+                if (input_fd) { // don't close if input is coming from fd o aka STDIN
+                    logger->debug(logger, "Closing read-side of the pipe (fd %d) on main thread", pipefd[1]);
+                    close(pipefd[0]);
+                }
+            }
         }
 
         for (int i = 0; i < job_cnt; i++) {
