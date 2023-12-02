@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
+#include "logger.h"
 
 #define CMD_BUFFER_SIZE 1024
 #define MAX_JOBS 8
@@ -138,6 +139,11 @@ int main () {
 
     signal(SIGINT, handle_sigint);
 
+    struct Logger *logger = setupLogger();
+    logger->initialize(logger, "shell_log.txt", LOG_DEBUG);
+
+    logger->info(logger, "Application started");
+
     render_prompt();
     
     while (1) {
@@ -151,7 +157,7 @@ int main () {
         int job_cnt = parse_command_line(cmd_buffer, jobs, pipes);
         int pipe_cnt = job_cnt - 1;
 
-        if (DEBUG) printf("found %d jobs\n", job_cnt);
+        logger->debug(logger, "found %d jobs", job_cnt);
 
         if (jobs[0]->args[0] == NULL) { 
             render_prompt();
@@ -159,6 +165,8 @@ int main () {
         }
         
         if ((strcmp(TOKEN_EXIT, jobs[0]->args[0])) == 0 || (strcmp(TOKEN_LOGOUT, jobs[0]->args[0])) == 0) {
+            logger->info(logger, "Exiting application via %s", jobs[0]->args[0]);
+            logger->info(logger, "Goodbye!");
             return 0;
         }
         
@@ -170,38 +178,38 @@ int main () {
 
         for (int i = 0; i < job_cnt; i++) {
             debug_child_proc(jobs[i]);
-            if (DEBUG) printf("[%d] Forking child %d\n", getpid(), i);
+            logger->debug(logger, "Forking child %d", i);
             
             jobs[i]->pid = fork();
 
             if (jobs[i]->pid < 0) {
-                if (DEBUG) printf("Unable to fork\n");
+                logger->debug(logger, "Unable to fork"); 
             } else if (jobs[i]->pid == 0) {
                 // Child Process
                 
-                if (DEBUG) printf("[%d] Hello from child (%d) process\n", getpid(), i);
+                logger->debug(logger, "Hello from child (%d) process", i);
                 // Fiddle with IO streams
-                if (DEBUG) printf("[%d] Checking input stream (%d)...\n", getpid(), jobs[i]->ifd);
+                logger->debug(logger, "Checking input stream (%d)...", jobs[i]->ifd);
                 if (jobs[i]->ifd != STDIN_FILENO) {
-                    if (DEBUG) printf("\t[%d] Dup2-ing fd (%d) to STDIN (%d)\n", getpid(), jobs[i]->ifd, STDIN_FILENO);
+                    logger->debug(logger, "Dup2-ing fd (%d) to STDIN (%d)", jobs[i]->ifd, STDIN_FILENO);
                     dup2(jobs[i]->ifd, STDIN_FILENO);
                 }
 
-                if (DEBUG) printf("[%d] Checking output stream (%d)...\n", getpid(), jobs[i]->ofd);
+                logger->debug(logger, "Checking output stream (%d)...", jobs[i]->ofd);
                 if (jobs[i]->ofd != STDOUT_FILENO) {
-                    if (DEBUG) printf("\t[%d] Dup2-ing fd (%d) to stdout (%d)\n", getpid(), jobs[i]->ofd, STDOUT_FILENO);
+                    logger->debug(logger, "Dup2-ing fd (%d) to stdout (%d)", jobs[i]->ofd, STDOUT_FILENO);
                     dup2(jobs[i]->ofd, STDOUT_FILENO);
                 }
 
                 // Close any fd's that aren't needed from the pipe array
                 for(int p = 0; p < pipe_cnt; p++) {
                     if (pipes[p]->writer != jobs[i]) {
-                        // if (DEBUG) printf("\t[%d] Closing pipe %d writer (fd %d)\n", getpid(), p, pipes[p].write_fd);
+                        logger->debug(logger, "Closing pipe %d writer (fd %d)", p, pipes[p]->write_fd);
                         if (-1 == close(pipes[p]->write_fd)) perror("close (write)");
                     }
 
                     if (pipes[p]->reader != jobs[i]) {
-                        // if (DEBUG) printf("\t[%d] Closing pipe %d reader (fd %d)\n", getpid(), p, pipes[p].read_fd);
+                        logger->debug(logger, "Closing pipe %d reader (fd %d)", p, pipes[p]->read_fd);
                         if (-1 == close(pipes[p]->read_fd)) perror("close (read)");
                     }
                 }
@@ -214,22 +222,24 @@ int main () {
         }
 
         for(int p = 0; p < pipe_cnt; p++) {
-            if (DEBUG) printf("[%d] Closing pipe %d read-side on main thread (%d)\n", getpid(), p, pipes[p]->read_fd);
+            logger->debug(logger, "Closing pipe %d read-side on main thread (%d)", p, pipes[p]->read_fd);
             if (-1 == close(pipes[p]->read_fd)) perror("close (read)");
             
-            if (DEBUG) printf("[%d] Closing pipe %d write-side on main thread (%d)\n", getpid(), p, pipes[p]->write_fd);
+            logger->debug(logger, "Closing pipe %d write-side on main thread (%d)", p, pipes[p]->write_fd);
             if (-1 == close(pipes[p]->write_fd)) perror("close (read)");
 
             free(pipes[p]);
         }
 
         for (int i = 0; i < job_cnt; i++) {
-            if (DEBUG) printf("[%d] Waiting on child %d running '%s' (pid %d)\n", getpid(), i, jobs[i]->args[0], jobs[i]->pid);
+            logger->debug(logger, "Waiting on child %d running '%s' (pid %d)", i, jobs[i]->args[0], jobs[i]->pid);
             waitpid(jobs[i]->pid, NULL, 0);
-            if (DEBUG) printf("[%d] Child %d running '%s' (pid %d) has returned\n", getpid(), i, jobs[i]->args[0], jobs[i]->pid);
+            logger->debug(logger, "Child %d running '%s' (pid %d) has returned", i, jobs[i]->args[0], jobs[i]->pid);
             free(jobs[i]);
         }
 
         render_prompt();
     }
+
+    destroyLogger(logger);
 }
