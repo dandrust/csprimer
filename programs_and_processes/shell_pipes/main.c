@@ -7,23 +7,25 @@
 #include <errno.h>
 #include <fcntl.h>
 #include "logger.h"
+#include "process.h"
+#include "job.h"
 
 #define CMD_BUFFER_SIZE 1024
-#define MAX_JOBS 8
-#define MAX_PIPES MAX_JOBS - 1
-#define MAX_ARGS 16
+#define MAX_JOBS 32
+#define MAX_PROCESSES 8
 #define TOKEN_EXIT "exit"
 #define TOKEN_HELP "help"
 #define TOKEN_LOGOUT "logout"
 #define TOKEN_PIPE "|"
+#define TOKEN_JOBS "jobs"
+#define TOKEN_AMP "&"
+#define TOKEN_FG "fg"
+#define TOKEN_BG "bg"
 
-#define DEBUG 0
+struct Job *jobs[MAX_JOBS];
 
 // TODO is this still being used?
-volatile pid_t child_proc;
-
-// Temporarily reference this as an extern
-extern void execute(char *);
+volatile pid_t child_pid;
 
 void render_prompt() {
     printf("> ");
@@ -31,106 +33,148 @@ void render_prompt() {
 }
 
 void handle_sigint() {
-    if(!child_proc) { 
-        return;
-    }
-
-    kill(child_proc, SIGINT);
-}
-
-/* 
-    Process Stuff
-*/
-struct Process {
-    int ifd;
-    int ofd;
-    char *args[MAX_ARGS];
-    pid_t pid;
-    char* (*print)(struct Process *);
-    char printStr[1024];
-};
-
-char *processPrint(struct Process *p) {
-    int written;
-    char *start_at = p->printStr;
-
-    written = sprintf(p->printStr, "Process for");
-    start_at += written;
-
-    for (int i = 0; p->args[i] != NULL; i++) {
-        written = sprintf(start_at, " %s", p->args[i]);
-        start_at += written;
-    }
+    struct Logger *l = setupLogger();
+    l->initialize(l, "shell_log.txt", LOG_DEBUG);
     
-    return p->printStr;
+    l->debug(l, "SIGINT!");
+
+    if(!child_pid) { 
+        l->debug(l, "SIGINT caught by child before exec'ing. Returning...");
+        exit(0);
+    }
 }
 
-struct Process *setupProcess() {
-    struct Process *p = malloc(sizeof(struct Process));
-    p->print = processPrint;
-}
-
-void destroyProcess(struct Process *p) {
-    free(p);
-}
-
-/* 
-    END Process Stuff
-*/
-
-int parse_command_line(char *buffer, struct Process *jobs[], struct Logger *logger) {
+int parse_command_line(char *buffer, struct Process *processes[], struct Logger *logger) {
     int job_no = 0;
     int arg_no = 0;
 
-    jobs[job_no] = setupProcess();
+    processes[job_no] = setupProcess();
 
     char *last_token;
-    jobs[job_no]->args[arg_no] = strtok(buffer, " \t\n");
-    last_token = jobs[job_no]->args[arg_no];
+    processes[job_no]->args[arg_no] = strtok(buffer, " \t\n");
+    last_token = processes[job_no]->args[arg_no];
     logger->debug(logger, "read: %s (job %d, arg %d)", last_token, job_no, arg_no);
 
     while (last_token != NULL) { // until we reach end of string
-        jobs[job_no]->args[++arg_no] = strtok(NULL, " \t\n"); // get the next token
-        last_token = jobs[job_no]->args[arg_no];
+        processes[job_no]->args[++arg_no] = strtok(NULL, " \t\n"); // get the next token
+        last_token = processes[job_no]->args[arg_no];
         logger->debug(logger, "read: %s (job %d, arg %d)", last_token, job_no, arg_no);
 
-        if (jobs[job_no]->args[arg_no] != NULL && strcmp(TOKEN_PIPE, jobs[job_no]->args[arg_no]) == 0) { // if the next token is a pipe
+        if (processes[job_no]->args[arg_no] != NULL && strcmp(TOKEN_PIPE, processes[job_no]->args[arg_no]) == 0) { // if the next token is a pipe
             logger->debug(logger, "pipe detected!");
-            jobs[job_no]->args[arg_no] = NULL; //      write NULL to args[i]
+            processes[job_no]->args[arg_no] = NULL; //      write NULL to args[i]
             
             // Pointer accounting (point to next job)
             job_no++;   //      increment the job index
-            jobs[job_no] = setupProcess();
+            processes[job_no] = setupProcess();
             logger->debug(logger, "incremented job no to %d", job_no);
             arg_no = -1;   //      set arg index to zero
             logger->debug(logger, "reset arg no to %d", arg_no);
         }
+
+        if (processes[job_no]->args[arg_no] != NULL && strcmp(TOKEN_AMP, processes[job_no]->args[arg_no]) == 0) { // if the next token is an `&`
+            // If we find `&` assume that it's the last token and get out
+            processes[job_no]->args[arg_no] = NULL;
+            processes[job_no]->background = 1;
+            break;
+        }
     }
+    logger->debug(logger, "found %d jobs", job_no + 1);
     return job_no + 1;
 }
 
-// struct Job {
-//     char *command; // may not need this...
-//     // pid
-// };
+void handle_sigchild() {
+    struct Logger *l = setupLogger();
+    l->initialize(l, "shell_log.txt", LOG_DEBUG);
+    
+    l->debug(l, "SIGCHLD!");
+    pid_t pid;
+    
+    int status;
+    // find out which child has terminated
+    while ((pid = waitpid(-1, &status, WNOHANG|WCONTINUED)) > 0 ) {
+        l->debug(l, "signal recieved by child pid %d", pid);
 
-// struct Process {
-//     char *args[MAX_ARGS];
-// };
+        if (WIFEXITED(status)) {
+            l->debug(l, "triggered by WIFEXITED (%d)", WEXITSTATUS(status));
+        }
 
-// struct ProcessGroup {
+        if (WIFSIGNALED(status)) {
+            l->debug(l, "triggered by WIFSIGNALED (sig %d)", WTERMSIG(status));
+        }
 
-// };
+        if (WIFSTOPPED(status)) { // This is what got triggered for SIGTSTP, signal code matched (20)
+            l->debug(l, "triggered by WIFSTOPPED (sig %d)", WSTOPSIG(status));
+        }
 
+        if (WIFCONTINUED(status)) { // This is what got triggered by SIGCONT
+            l->debug(l, "triggered by WIFCONTINUED");
+        }
 
+        int j = 0;
+        // find the corresponding job
+        while (jobs[j] != NULL) {
+            if (jobs[j]->pid == pid) { 
+                l->debug(l, "found child pid %d in jobs array", pid);
+                // And update it's state
+                jobs[j]->state = JOB_STATE_DONE;
+            }
+            j++;
+        }
+    }
+}
 
+void handle_sigtstop() {
+    struct Logger *l = setupLogger();
+    l->initialize(l, "shell_log.txt", LOG_DEBUG);
+    
+    l->debug(l, "SIGTSTP!");
+    free(l);
+}
+
+/*
+    Todo for job control:
+    x Read the last token. If it's `&` don't wait on the pid (Single command) and add it to a jobs array
+    x Implement a jobs builtin to print one line per job
+    x SIGCHLD updates job state
+    - print [jid] pid when background process starts
+    - print [jib] Done <command> only on first `jobs` call after finish
+    - Make `kill` a builtin wrapper that can intercept a job number (%1, %2, etc)
+
+    Unknowns:
+    - How can I prevent background process from reading from STDIN/STDOUT, then later make it read from those?
+    - What signal can I use to suspend? Unsuspend?
+    - Can you use a keyboard shortcut to push a running process into the background?
+    - Will I need to set up an intermediary process for process groups so that I can send a signal all of them?
+        - Will I need to do this for any/all foreground processes just in case they're pushed into the background?
+
+    Thoughts:
+    - Don't create a `Job` struct until you have to. Ie, it's issued with a trailing & OR the user pushes a fg process to the bg
+    - Increment a counter for job no, for simplicity just implement an array to hold the jobs
+    - 
+
+    How can I change the terminal process group ID on the main thread?
+        int tcsetpgrp(int fd, pid_t pgrp);
+    
+    What is SIGTTOU?
+
+    How do I get the TTY fd?
+        fileno(stdout)
+*/
 int main () {
     char cmd_buffer[CMD_BUFFER_SIZE];
-    struct Process *jobs[MAX_JOBS];
-    struct pipe *pipes[MAX_PIPES];
+    struct Process *processes[MAX_PROCESSES];
     int pipefd[2];
+    int next_job_i = 0;
+    int terminal_fd = fileno(stdout);
+    
+    for(int j = 0; j < MAX_JOBS; j++) {
+        jobs[j] = NULL;
+    }
 
     signal(SIGINT, handle_sigint);
+    signal(SIGCHLD, handle_sigchild);
+    signal(SIGTSTP, handle_sigtstop);
 
     struct Logger *logger = setupLogger();
     logger->initialize(logger, "shell_log.txt", LOG_DEBUG);
@@ -147,32 +191,50 @@ int main () {
 
         fgets(cmd_buffer, CMD_BUFFER_SIZE, stdin);
 
-        int job_cnt = parse_command_line(cmd_buffer, jobs, logger);
-        int pipe_cnt = job_cnt - 1;
+        int job_cnt = parse_command_line(cmd_buffer, processes, logger);
 
-        logger->debug(logger, "found %d jobs", job_cnt);
-
-        if (jobs[0]->args[0] == NULL) { 
+        if (processes[0]->args[0] == NULL) { 
             render_prompt();
             continue;
         }
         
-        if ((strcmp(TOKEN_EXIT, jobs[0]->args[0])) == 0 || (strcmp(TOKEN_LOGOUT, jobs[0]->args[0])) == 0) {
-            logger->info(logger, "Exiting application via %s", jobs[0]->args[0]);
+        if ((strcmp(TOKEN_EXIT, processes[0]->args[0])) == 0 || (strcmp(TOKEN_LOGOUT, processes[0]->args[0])) == 0) {
+            logger->info(logger, "Exiting application via %s", processes[0]->args[0]);
             logger->info(logger, "Goodbye!");
             return 0;
         }
         
-        if ((strcmp(TOKEN_HELP, jobs[0]->args[0])) == 0) {
+        if ((strcmp(TOKEN_HELP, processes[0]->args[0])) == 0) {
             printf("help is on the way!\n");
             render_prompt();
             continue;
         }
 
+        if ((strcmp(TOKEN_JOBS, processes[0]->args[0])) == 0) {
+            logger->debug(logger, "Hit jobs builtin");
+            
+            int j = 0;
+
+            while(jobs[j] != NULL) {
+                logger->debug(logger, "jobs %p", jobs[j]);
+                printf("%s\n", jobs[j]->print(jobs[j]));
+                j++;
+            }
+            render_prompt();
+            continue;
+        }
+
+        if ((strcmp(TOKEN_FG, processes[0]->args[0])) == 0) {
+            logger->debug(logger, "Hit fg builtin");
+            
+            // Parse the arg (%n)
+            // 
+        }
+
         int input_fd = 0;
 
         for (int i = 0; i < job_cnt; i++) {
-            logger->debug(logger, "Preparing to fork child %d (%s)", i, jobs[i]->print(jobs[i]));
+            logger->debug(logger, "Preparing to fork child %d (%s)", i, processes[i]->print(processes[i]));
 
             // If there is another process downstream create a pipe
             if (i < (job_cnt - 1)) {
@@ -184,16 +246,19 @@ int main () {
                 };
             }
 
-            logger->debug(logger, "Forking child %d (%s)", i, jobs[i]->print(jobs[i]));
+            logger->debug(logger, "Forking child %d (%s)", i, processes[i]->print(processes[i]));
             
-            jobs[i]->pid = fork();
-
-            if (jobs[i]->pid < 0) {
+            child_pid = fork();
+            processes[i]->pid = child_pid;
+            
+            if (processes[i]->pid < 0) {
                 logger->debug(logger, "Unable to fork"); 
-            } else if (jobs[i]->pid == 0) {
+            } else if (processes[i]->pid == 0) {
                 // Child Process
-                
+
+
                 logger->debug(logger, "Hello from child (%d) process", i);
+                logger->debug(logger, "child_pid: %d", child_pid);
 
                 // Check input stream
                 if (input_fd != STDIN_FILENO) {
@@ -215,18 +280,38 @@ int main () {
                     close(pipefd[1]);
                 }
 
-                int rc_exec = execvp(jobs[i]->args[0], jobs[i]->args);
+                logger->debug(logger, "Ready to exec");
+                int rc_exec = execvp(processes[i]->args[0], processes[i]->args);
                 if (rc_exec == -1) { 
                     return 0;
                 }
             }
 
+            // TODO: I have no idea what's up and what's down with all of this
+            // This assignment sheet seems to have some pointers, maybe I'll try to start there next time
+            // https://www.andrew.cmu.edu/course/15-310/applications/homework/homework4/lab4.pdf
+
+            logger->debug(logger, "Setting term proc grp id to %d", child_pid);
+            int foo = tcsetpgrp(terminal_fd, child_pid);
+            if (foo == -1)
+                perror("set terminal group");
+            logger->debug(logger, "Terminal group is %d", tcgetpgrp(terminal_fd));
+
+            logger->debug(logger, "Setting proc grp id of child %d to %d", child_pid, child_pid);
+            int bar = setpgid(0, child_pid);
+            if (bar == -1)
+                perror("set process group");
+            logger->debug(logger, "Process group for child (%d) is %d", child_pid, getpgid(child_pid));
+            
+
             // Back in the parent thread...
+            logger->debug(logger, "child_pid: %d", child_pid);
+
             if (i < job_cnt - 1) {
                 logger->debug(logger, "Closing write-side of the pipe (fd %d) on main thread", pipefd[1]);
                 close(pipefd[1]);
                 
-                logger->debug(logger, "Setting input_fd to %d for downstream (%s)", pipefd[0], jobs[i+1]->print(jobs[i+1]));
+                logger->debug(logger, "Setting input_fd to %d for downstream (%s)", pipefd[0], processes[i+1]->print(processes[i+1]));
                 input_fd = pipefd[0];
             } else {
                 if (input_fd) { // don't close if input is coming from fd o aka STDIN
@@ -236,11 +321,45 @@ int main () {
             }
         }
 
+
         for (int i = 0; i < job_cnt; i++) {
-            logger->debug(logger, "Waiting on child %d running '%s' (pid %d)", i, jobs[i]->args[0], jobs[i]->pid);
-            waitpid(jobs[i]->pid, NULL, 0);
-            logger->debug(logger, "Child %d running '%s' (pid %d) has returned", i, jobs[i]->args[0], jobs[i]->pid);
-            free(jobs[i]);
+            if (processes[i]->background) {
+                logger->debug(logger, "Not waiting on on child %d running '%s' (pid %d)", i, processes[i]->args[0], processes[i]->pid);
+                
+                jobs[next_job_i] = setupJob();
+                jobs[next_job_i]->state = JOB_STATE_RUNNING;
+                jobs[next_job_i]->jid = next_job_i + 1;
+                jobs[next_job_i]->pid = processes[i]->pid;
+                next_job_i++;
+            } else {
+                logger->debug(logger, "Waiting on child %d running '%s' (pid %d)", i, processes[i]->args[0], processes[i]->pid);
+                int fg_status;
+                waitpid(processes[i]->pid, &fg_status, WUNTRACED);
+
+                if (WIFEXITED(fg_status)) {
+                    logger->debug(logger, "Child %d running '%s' (pid %d) has returned", i, processes[i]->args[0], processes[i]->pid);
+                    free(processes[i]);
+                } else if (WIFSTOPPED(fg_status)) {
+                    logger->debug(logger, "Child %d running '%s' (pid %d) was stopped", i, processes[i]->args[0], processes[i]->pid);
+                    jobs[next_job_i] = setupJob();
+                    jobs[next_job_i]->state = JOB_STATE_STOPPED;
+                    jobs[next_job_i]->jid = next_job_i + 1;
+                    jobs[next_job_i]->pid = processes[i]->pid;
+                    jobs[next_job_i]->command = processes[i]->print(processes[i]);
+
+                    // TODO: Update struct Process to get only the command (instead of the debugging print string)
+                    printf("\n[%d] %s\t%s\n", jobs[next_job_i]->jid, jobs[next_job_i]->stateLabel(jobs[next_job_i]), jobs[next_job_i]->command);
+
+                    next_job_i++;
+
+                    // TODO: something needs to change here so that the stopped process isn't reading/writing to STDIN/OUT
+                    int foo = tcsetpgrp(terminal_fd, getpid());
+                    if (foo == -1)
+                        perror("set terminal group");
+                    
+                }
+                
+            }
         }
 
         render_prompt();
