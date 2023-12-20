@@ -1,0 +1,8 @@
+# multipass launch -n csprimer -c 4 --mount /Users/dan_personal/src/csprimer:/home/ubuntu/src/csprimer --cloud-init primary.yml
+
+ssh_authorized_keys:
+- 
+
+package_update: true
+packages:
+- build-essential
